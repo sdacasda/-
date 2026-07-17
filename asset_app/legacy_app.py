@@ -34,7 +34,7 @@ from pydantic import BaseModel
 
 DB_PATH = os.getenv("DB_PATH", "asset_management.db")
 APP_NAME = os.getenv("APP_NAME", "资产智能管控台")
-APP_VERSION = os.getenv("APP_VERSION", "v24")
+APP_VERSION = os.getenv("APP_VERSION", "v26.1")
 APP_BUILD_TIME = os.getenv("APP_BUILD_TIME", "2026-06-22")
 SESSION_COOKIE_NAME = "asset_session"
 SESSION_DAYS = int(os.getenv("SESSION_DAYS", "7"))
@@ -61,6 +61,7 @@ LEGACY_SOURCE_URL_ALIASES = {
     "https://shengshi888.cc/": "盛世",
     "http://wansheng888.cc/": "万盛",
     "https://nbcz.top/": "嘉盛",
+    "https://chuangshi88.cc/": "创世",
 }
 
 LOGIN_LOCK = threading.Lock()
@@ -141,12 +142,107 @@ def source_group_from_name(name: str) -> str:
     return raw.strip()
 
 
+def normalize_source_group_for_alias(name: str) -> str:
+    return source_group_from_name(name).strip().lower()
+
+
+
+# 关键词别名。用于把历史同步关键词继续归到当前数据源标签下。
+# 例如旧记录 keyword=郑州 / 管城回族区，现在统一归到 default_keyword=管城。
+DEFAULT_KEYWORD_ALIASES = {
+    "郑州": "管城",
+    "管城回族区": "管城",
+    "管城回族": "管城",
+    "龙湖街道": "新郑市龙湖街道",
+}
+
+
+def normalize_keyword_for_alias(keyword: str) -> str:
+    return str(keyword or "").strip().lower()
+
+
+def canonical_keyword_for_alias(keyword: str, alias_map: Optional[Dict[str, str]] = None) -> str:
+    raw = str(keyword or "").strip()
+    if not raw:
+        return ""
+    amap = alias_map or DEFAULT_KEYWORD_ALIASES
+    # 精确别名优先。
+    if raw in amap:
+        return str(amap[raw] or "").strip()
+    lowered = raw.lower()
+    for alias, canonical in amap.items():
+        if str(alias).strip().lower() == lowered:
+            return str(canonical or "").strip()
+    return raw
+
+
+def keyword_matches_for_alias(record_keyword: str, default_keyword: str, alias_map: Optional[Dict[str, str]] = None) -> bool:
+    rk = str(record_keyword or "").strip()
+    dk = str(default_keyword or "").strip()
+    if not dk:
+        return True
+    if normalize_keyword_for_alias(rk) == normalize_keyword_for_alias(dk):
+        return True
+    crk = canonical_keyword_for_alias(rk, alias_map)
+    cdk = canonical_keyword_for_alias(dk, alias_map)
+    return normalize_keyword_for_alias(crk) == normalize_keyword_for_alias(cdk)
+
+
+def seed_source_keyword_aliases(conn: sqlite3.Connection) -> None:
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS source_keyword_aliases (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            alias_keyword TEXT NOT NULL,
+            canonical_keyword TEXT NOT NULL,
+            source_id INTEGER,
+            source_group TEXT,
+            created_at TEXT NOT NULL,
+            UNIQUE(alias_keyword, canonical_keyword, source_id)
+        )
+    """)
+    for alias, canonical in DEFAULT_KEYWORD_ALIASES.items():
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO source_keyword_aliases(alias_keyword, canonical_keyword, source_id, source_group, created_at)
+            VALUES(?, ?, NULL, '', ?)
+            """,
+            (alias, canonical, now_text()),
+        )
+
+
+def get_keyword_alias_map(conn: sqlite3.Connection) -> Dict[str, str]:
+    data = dict(DEFAULT_KEYWORD_ALIASES)
+    try:
+        for row in conn.execute("SELECT alias_keyword, canonical_keyword FROM source_keyword_aliases"):
+            alias = str(row["alias_keyword"] or "").strip()
+            canonical = str(row["canonical_keyword"] or "").strip()
+            if alias and canonical:
+                data[alias] = canonical
+    except Exception:
+        pass
+    return data
+
+def remember_source_name_alias(conn: sqlite3.Connection, old_name: str, new_name: str, source_id: Optional[int] = None, changed_by: str = "", reason: str = "") -> None:
+    old_group = source_group_from_name(old_name)
+    new_group = source_group_from_name(new_name)
+    if not old_group or not new_group or normalize_source_group_for_alias(old_group) == normalize_source_group_for_alias(new_group):
+        return
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO source_name_aliases(old_group, new_group, source_id, reason, changed_by, created_at)
+        VALUES(?, ?, ?, ?, ?, ?)
+        """,
+        (old_group, new_group, int(source_id) if source_id else None, reason or "标头改名", changed_by or "", now_text()),
+    )
+
+
 def seed_source_url_aliases(conn: sqlite3.Connection) -> None:
     conn.execute("""
         CREATE TABLE IF NOT EXISTS source_url_aliases (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             source_url TEXT NOT NULL UNIQUE,
             source_group TEXT NOT NULL,
+            source_id INTEGER,
             created_at TEXT NOT NULL
         )
     """)
@@ -157,15 +253,22 @@ def seed_source_url_aliases(conn: sqlite3.Connection) -> None:
         )
 
 
-def remember_source_url_alias(conn: sqlite3.Connection, source_url: str, source_name: str) -> None:
+def remember_source_url_alias(conn: sqlite3.Connection, source_url: str, source_name: str, source_id: Optional[int] = None) -> None:
     group = source_group_from_name(source_name)
     url = normalize_source_url_for_alias(source_url)
     if not url or not group:
         return
-    conn.execute(
-        "INSERT OR IGNORE INTO source_url_aliases(source_url, source_group, created_at) VALUES(?, ?, ?)",
-        (url, group, now_text()),
-    )
+    existing = conn.execute("SELECT id FROM source_url_aliases WHERE source_url=?", (url,)).fetchone()
+    if existing:
+        conn.execute(
+            "UPDATE source_url_aliases SET source_group=?, source_id=COALESCE(?, source_id) WHERE source_url=?",
+            (group, int(source_id) if source_id else None, url),
+        )
+    else:
+        conn.execute(
+            "INSERT INTO source_url_aliases(source_url, source_group, source_id, created_at) VALUES(?, ?, ?, ?)",
+            (url, group, int(source_id) if source_id else None, now_text()),
+        )
 
 
 def record_source_url_history(conn: sqlite3.Connection, source_id: int, source_name: str, old_url: str, new_url: str, changed_by: str = "", reason: str = "") -> None:
@@ -221,7 +324,57 @@ def repair_asset_source_bindings(conn: sqlite3.Connection) -> None:
           ) = 1
     """)
 
-    # 3) 旧网址别名绑定：例如 shengshi888.cc 仍归“盛世”，再按关键词匹配到“盛世｜龙湖街道”。
+    # 3) 旧网址别名如果已经绑定到具体 source_id，优先按 source_id 修复。
+    conn.execute("""
+        UPDATE asset_records
+        SET source_id = (
+            SELECT sc.id
+            FROM source_url_aliases al
+            JOIN source_configs sc ON sc.id = al.source_id
+            WHERE al.source_url = lower(rtrim(asset_records.source_url, '/'))
+              AND al.source_id IS NOT NULL
+              AND (COALESCE(sc.default_keyword, '') = COALESCE(asset_records.keyword, '') OR COALESCE(sc.default_keyword, '') = '')
+            ORDER BY sc.updated_at DESC, sc.id DESC
+            LIMIT 1
+        )
+        WHERE source_id IS NULL
+          AND EXISTS (
+            SELECT 1
+            FROM source_url_aliases al
+            JOIN source_configs sc ON sc.id = al.source_id
+            WHERE al.source_url = lower(rtrim(asset_records.source_url, '/'))
+              AND al.source_id IS NOT NULL
+              AND (COALESCE(sc.default_keyword, '') = COALESCE(asset_records.keyword, '') OR COALESCE(sc.default_keyword, '') = '')
+          )
+    """)
+
+    # 4) 标头改名别名：例如“万盛”改成“强盛”后，旧网址仍能归到新标头。
+    conn.execute("""
+        UPDATE asset_records
+        SET source_id = (
+            SELECT sc.id
+            FROM source_url_aliases al
+            JOIN source_name_aliases na ON lower(na.old_group) = lower(al.source_group)
+            JOIN source_configs sc ON sc.id = na.source_id
+            WHERE al.source_url = lower(rtrim(asset_records.source_url, '/'))
+              AND na.source_id IS NOT NULL
+              AND (COALESCE(sc.default_keyword, '') = COALESCE(asset_records.keyword, '') OR COALESCE(sc.default_keyword, '') = '')
+            ORDER BY sc.updated_at DESC, sc.id DESC
+            LIMIT 1
+        )
+        WHERE source_id IS NULL
+          AND EXISTS (
+            SELECT 1
+            FROM source_url_aliases al
+            JOIN source_name_aliases na ON lower(na.old_group) = lower(al.source_group)
+            JOIN source_configs sc ON sc.id = na.source_id
+            WHERE al.source_url = lower(rtrim(asset_records.source_url, '/'))
+              AND na.source_id IS NOT NULL
+              AND (COALESCE(sc.default_keyword, '') = COALESCE(asset_records.keyword, '') OR COALESCE(sc.default_keyword, '') = '')
+          )
+    """)
+
+    # 5) 旧网址别名按标头名称兜底绑定：例如 shengshi888.cc 仍归“盛世”。
     conn.execute("""
         UPDATE asset_records
         SET source_id = (
@@ -245,7 +398,90 @@ def repair_asset_source_bindings(conn: sqlite3.Connection) -> None:
           )
     """)
 
+    # 6) 关键词别名兜底修复：郑州/管城回族区/管城回族 -> 管城，龙湖街道 -> 新郑市龙湖街道。
+    repair_asset_source_bindings_by_alias_rules(conn)
 
+
+
+
+def repair_asset_source_bindings_by_alias_rules(conn: sqlite3.Connection) -> int:
+    """按旧网址、旧标头和关键词别名做兜底修复。只给 source_id 为空的记录补分类，不删除、不覆盖已有分类。"""
+    alias_map = get_keyword_alias_map(conn)
+
+    configs = []
+    for row in conn.execute("SELECT id, name, source_url, default_keyword, updated_at FROM source_configs WHERE COALESCE(enabled, 1)=1"):
+        configs.append({
+            "id": int(row["id"]),
+            "name": row["name"] or "",
+            "group": source_group_from_name(row["name"] or ""),
+            "url": normalize_source_url_for_alias(row["source_url"] or ""),
+            "keyword": row["default_keyword"] or "",
+            "updated_at": row["updated_at"] or "",
+        })
+    config_by_id = {c["id"]: c for c in configs}
+
+    url_aliases = {}
+    for row in conn.execute("SELECT source_url, source_group, source_id FROM source_url_aliases"):
+        url = normalize_source_url_for_alias(row["source_url"] or "")
+        if url:
+            url_aliases[url] = {"group": row["source_group"] or "", "source_id": int(row["source_id"]) if row["source_id"] else None}
+
+    name_aliases = {}
+    for row in conn.execute("SELECT old_group, new_group, source_id FROM source_name_aliases"):
+        old = normalize_source_group_for_alias(row["old_group"] or "")
+        if old:
+            name_aliases[old] = {"new_group": row["new_group"] or "", "source_id": int(row["source_id"]) if row["source_id"] else None}
+
+    def pick_candidate(asset_url: str, asset_keyword: str) -> Optional[int]:
+        url = normalize_source_url_for_alias(asset_url)
+        candidates = []
+
+        # 当前网址匹配。
+        candidates.extend([c for c in configs if c["url"] == url])
+
+        # 旧网址别名匹配。
+        al = url_aliases.get(url)
+        if al:
+            sid = al.get("source_id")
+            if sid and sid in config_by_id:
+                candidates.append(config_by_id[sid])
+            group_norm = normalize_source_group_for_alias(al.get("group") or "")
+            if group_norm in name_aliases:
+                nsid = name_aliases[group_norm].get("source_id")
+                if nsid and nsid in config_by_id:
+                    candidates.append(config_by_id[nsid])
+            group = al.get("group") or ""
+            if group:
+                candidates.extend([c for c in configs if normalize_source_group_for_alias(c["group"]) == normalize_source_group_for_alias(group)])
+
+        # 去重。
+        uniq = []
+        seen = set()
+        for c in candidates:
+            if c["id"] not in seen:
+                uniq.append(c)
+                seen.add(c["id"])
+
+        matched = [c for c in uniq if keyword_matches_for_alias(asset_keyword, c["keyword"], alias_map)]
+        if not matched:
+            return None
+        # 优先：当前网址精确匹配，其次有具体 source_id 的别名，最后更新时间。
+        matched.sort(key=lambda c: (1 if c["url"] == url else 0, c["updated_at"], c["id"]), reverse=True)
+        return int(matched[0]["id"])
+
+    rows = conn.execute("""
+        SELECT id, source_url, keyword
+        FROM asset_records
+        WHERE (source_id IS NULL OR source_id=0 OR source_id='')
+          AND deleted_at IS NULL
+    """).fetchall()
+    fixed = 0
+    for row in rows:
+        sid = pick_candidate(row["source_url"] or "", row["keyword"] or "")
+        if sid:
+            conn.execute("UPDATE asset_records SET source_id=? WHERE id=?", (sid, row["id"]))
+            fixed += 1
+    return fixed
 
 
 def asset_status_priority_sql(expr: str = "status_type", timer_expr: str = "status_timer") -> str:
@@ -491,6 +727,31 @@ def init_db() -> None:
             created_at TEXT NOT NULL
         )
     """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS source_name_aliases (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            old_group TEXT NOT NULL,
+            new_group TEXT NOT NULL,
+            source_id INTEGER,
+            reason TEXT,
+            changed_by TEXT,
+            created_at TEXT NOT NULL,
+            UNIQUE(old_group, source_id)
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS source_url_aliases (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_url TEXT NOT NULL UNIQUE,
+            source_group TEXT NOT NULL,
+            source_id INTEGER,
+            created_at TEXT NOT NULL
+        )
+    """)
+    ensure_column(conn, "source_url_aliases", "source_id", "INTEGER")
+    seed_source_keyword_aliases(conn)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_keyword_alias ON source_keyword_aliases(alias_keyword, canonical_keyword)")
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS app_meta (
@@ -1245,6 +1506,10 @@ class SourceConfigPayload(BaseModel):
 
 class SourceAliasPayload(BaseModel):
     source_url: str
+
+
+class SourceNameAliasPayload(BaseModel):
+    old_name: str
 
 
 class UrlRollbackPayload(BaseModel):
@@ -2406,11 +2671,11 @@ def update_source(source_id: int, payload: SourceConfigPayload, user: Dict[str, 
         return JSONResponse({"success": False, "message": str(exc)}, status_code=400)
 
     conn = get_conn()
-    old_source = conn.execute("SELECT name, source_url FROM source_configs WHERE id=?", (source_id,)).fetchone()
+    old_source = conn.execute("SELECT id, name, source_url FROM source_configs WHERE id=?", (source_id,)).fetchone()
 
     try:
         if old_source:
-            remember_source_url_alias(conn, old_source["source_url"], old_source["name"])
+            remember_source_url_alias(conn, old_source["source_url"], old_source["name"], source_id)
             if normalize_source_url_for_alias(old_source["source_url"]) != normalize_source_url_for_alias(source_url):
                 record_source_url_history(conn, source_id, old_source["name"], old_source["source_url"], source_url, str(user.get("username", "")), "编辑数据源网址")
         cur = conn.execute("""
@@ -2437,8 +2702,13 @@ def update_source(source_id: int, payload: SourceConfigPayload, user: Dict[str, 
             """,
             (source_id, source_id, source_url, default_keyword, default_keyword),
         )
-        # 如果本次修改了网址，旧网址会被记录为别名；旧资产仍然归到原数据源标头下。
-        remember_source_url_alias(conn, source_url, name)
+        # 如果本次修改了网址或标头，旧网址/旧标头都会被记录为别名；旧资产仍然归到当前数据源下。
+        remember_source_url_alias(conn, source_url, name, source_id)
+        if old_source and normalize_source_group_for_alias(old_source["name"]) != normalize_source_group_for_alias(name):
+            remember_source_name_alias(conn, old_source["name"], name, source_id, str(user.get("username", "")), "编辑数据源标头")
+            old_group = source_group_from_name(old_source["name"])
+            new_group = source_group_from_name(name)
+            conn.execute("UPDATE source_url_aliases SET source_group=?, source_id=COALESCE(source_id, ?) WHERE lower(source_group)=lower(?) OR source_id=?", (new_group, source_id, old_group, source_id))
         repair_asset_source_bindings(conn)
         conn.commit()
         changed = cur.rowcount
@@ -2534,18 +2804,29 @@ def get_source_url_history(source_id: int, user: Dict[str, object] = Depends(req
         """,
         (source_id,),
     ).fetchall()
+    group = source_group_from_name(source["name"])
     aliases = conn.execute(
         """
-        SELECT id, source_url, source_group, created_at
+        SELECT id, source_url, source_group, source_id, created_at
         FROM source_url_aliases
-        WHERE source_group=?
+        WHERE source_id=? OR lower(source_group)=lower(?)
         ORDER BY id DESC
         LIMIT 100
         """,
-        (source_group_from_name(source["name"]),),
+        (source_id, group),
+    ).fetchall()
+    name_aliases = conn.execute(
+        """
+        SELECT id, old_group, new_group, source_id, reason, changed_by, created_at
+        FROM source_name_aliases
+        WHERE source_id=? OR lower(new_group)=lower(?)
+        ORDER BY id DESC
+        LIMIT 100
+        """,
+        (source_id, group),
     ).fetchall()
     conn.close()
-    return {"success": True, "data": [dict(r) for r in rows], "aliases": [dict(r) for r in aliases]}
+    return {"success": True, "data": [dict(r) for r in rows], "aliases": [dict(r) for r in aliases], "name_aliases": [dict(r) for r in name_aliases]}
 
 
 @app.post("/api/sources/{source_id}/aliases")
@@ -2557,15 +2838,46 @@ def add_source_url_alias_api(source_id: int, payload: SourceAliasPayload, user: 
         return JSONResponse({"success": False, "message": "数据源不存在"}, status_code=404)
     try:
         alias_url = validate_target_url(payload.source_url)
-        remember_source_url_alias(conn, alias_url, source["name"])
-        before = conn.execute("SELECT COUNT(1) AS c FROM asset_records WHERE source_id IS NULL AND deleted_at IS NULL").fetchone()["c"]
+        remember_source_url_alias(conn, alias_url, source["name"], source_id)
+        before = conn.execute("SELECT COUNT(1) AS c FROM asset_records WHERE (source_id IS NULL OR source_id=0 OR source_id='') AND deleted_at IS NULL").fetchone()["c"]
         repair_asset_source_bindings(conn)
-        after = conn.execute("SELECT COUNT(1) AS c FROM asset_records WHERE source_id IS NULL AND deleted_at IS NULL").fetchone()["c"]
+        after = conn.execute("SELECT COUNT(1) AS c FROM asset_records WHERE (source_id IS NULL OR source_id=0 OR source_id='') AND deleted_at IS NULL").fetchone()["c"]
         conn.commit()
         conn.close()
         fixed = max(0, before - after)
         add_log(f"旧网址别名已绑定：{source['name']} <- {alias_url}，修复 {fixed} 条", "info")
         return {"success": True, "message": f"旧网址别名已绑定，并修复历史分类 {fixed} 条。"}
+    except Exception as exc:
+        conn.close()
+        return JSONResponse({"success": False, "message": str(exc)}, status_code=400)
+
+
+@app.post("/api/sources/{source_id}/name_aliases")
+def add_source_name_alias_api(source_id: int, payload: SourceNameAliasPayload, user: Dict[str, object] = Depends(require_user)):
+    old_name = (payload.old_name or "").strip()
+    if not old_name:
+        return JSONResponse({"success": False, "message": "请填写旧标头名。"}, status_code=400)
+    conn = get_conn()
+    source = conn.execute("SELECT id, name FROM source_configs WHERE id=?", (source_id,)).fetchone()
+    if not source:
+        conn.close()
+        return JSONResponse({"success": False, "message": "数据源不存在"}, status_code=404)
+    try:
+        remember_source_name_alias(conn, old_name, source["name"], source_id, str(user.get("username", "")), "手动绑定旧标头名")
+        old_group = source_group_from_name(old_name)
+        new_group = source_group_from_name(source["name"])
+        conn.execute(
+            "UPDATE source_url_aliases SET source_group=?, source_id=COALESCE(source_id, ?) WHERE lower(source_group)=lower(?)",
+            (new_group, source_id, old_group),
+        )
+        before = conn.execute("SELECT COUNT(1) AS c FROM asset_records WHERE (source_id IS NULL OR source_id=0 OR source_id='') AND deleted_at IS NULL").fetchone()["c"]
+        repair_asset_source_bindings(conn)
+        after = conn.execute("SELECT COUNT(1) AS c FROM asset_records WHERE (source_id IS NULL OR source_id=0 OR source_id='') AND deleted_at IS NULL").fetchone()["c"]
+        conn.commit()
+        conn.close()
+        fixed = max(0, before - after)
+        add_log(f"旧标头别名已绑定：{old_group} -> {source['name']}，修复 {fixed} 条", "info")
+        return {"success": True, "message": f"旧标头别名已绑定，并修复历史分类 {fixed} 条。"}
     except Exception as exc:
         conn.close()
         return JSONResponse({"success": False, "message": str(exc)}, status_code=400)
@@ -2581,7 +2893,7 @@ def rollback_source_url(source_id: int, payload: UrlRollbackPayload, user: Dict[
         return JSONResponse({"success": False, "message": "记录不存在"}, status_code=404)
     old_current = source["source_url"]
     target_url = hist["old_url"]
-    remember_source_url_alias(conn, old_current, source["name"])
+    remember_source_url_alias(conn, old_current, source["name"], source_id)
     record_source_url_history(conn, source_id, source["name"], old_current, target_url, str(user.get("username", "")), "从网址变更记录回滚")
     conn.execute("UPDATE source_configs SET source_url=?, updated_at=? WHERE id=?", (target_url, now_text(), source_id))
     repair_asset_source_bindings(conn)
@@ -2594,9 +2906,9 @@ def rollback_source_url(source_id: int, payload: UrlRollbackPayload, user: Dict[
 @app.post("/api/maintenance/repair_source_bindings")
 def repair_source_bindings_api(user: Dict[str, object] = Depends(require_user)):
     conn = get_conn()
-    before = conn.execute("SELECT COUNT(1) AS c FROM asset_records WHERE source_id IS NULL AND deleted_at IS NULL").fetchone()["c"]
+    before = conn.execute("SELECT COUNT(1) AS c FROM asset_records WHERE (source_id IS NULL OR source_id=0 OR source_id='') AND deleted_at IS NULL").fetchone()["c"]
     repair_asset_source_bindings(conn)
-    after = conn.execute("SELECT COUNT(1) AS c FROM asset_records WHERE source_id IS NULL AND deleted_at IS NULL").fetchone()["c"]
+    after = conn.execute("SELECT COUNT(1) AS c FROM asset_records WHERE (source_id IS NULL OR source_id=0 OR source_id='') AND deleted_at IS NULL").fetchone()["c"]
     conn.commit()
     conn.close()
     fixed = max(0, before - after)
@@ -3197,6 +3509,14 @@ button{width:100%;height:48px;margin-top:22px;border:0;border-radius:10px;backgr
 .url-history-box{margin-top:12px;border:1px dashed #d0d5dd;border-radius:12px;padding:12px;background:#fbfdff}
 .url-history-list{display:grid;gap:8px;margin-top:8px}.url-history-item{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;align-items:center;border:1px solid #eef2f7;border-radius:10px;background:#fff;padding:9px}.url-history-item code{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:12px;color:#475467}.url-history-item .hint{font-size:12px;color:#667085;margin-top:4px}.url-alias-row{display:flex;gap:8px;margin-top:8px}.url-alias-row input{flex:1}.back-to-top{display:none;position:fixed;right:14px;bottom:78px;z-index:30;border:0;border-radius:999px;background:#1677ff;color:#fff;width:42px;height:42px;font-size:18px;font-weight:900;box-shadow:0 10px 24px rgba(22,119,255,.28)}
 @media(max-width:640px){#sourceSummary{position:sticky;top:48px;z-index:3;box-shadow:0 6px 16px rgba(15,23,42,.06)}#addressList .record{margin-bottom:8px!important;border:1px solid #e9eef6!important;background:#fff!important}#addressList .record-head{grid-template-columns:minmax(0,1fr) auto auto!important;gap:7px!important}#addressList .addr{font-size:15px!important;line-height:1.42!important;-webkit-line-clamp:3!important;word-break:break-word!important;overflow-wrap:anywhere!important}#addressList .copy-btn{height:32px!important;min-width:56px!important;padding:0 10px!important;align-self:start!important}#addressList .badge{height:30px!important;align-self:start!important}.record .mobile-meta{display:none!important}.back-to-top.show{display:grid;place-items:center}}
+/* v25 mobile precise search: show the existing PC search field on phones, scoped by selected source */
+@media(max-width:768px){
+  .asset-tools{display:grid!important;grid-template-columns:1fr!important;gap:8px!important;margin:0 0 10px!important;width:100%!important}
+  .asset-tools #sourceFilter{display:block!important;width:100%!important;order:1!important}
+  .asset-tools #assetSearch{display:block!important;width:100%!important;height:42px!important;order:2!important;border-radius:12px!important;border:1px solid #d0d5dd!important;background:#fff!important;padding:0 12px!important;font-size:15px!important;font-weight:800!important;color:#101828!important;box-shadow:0 2px 9px rgba(15,23,42,.04)!important}
+  .asset-tools #assetSearch::placeholder{color:#98a2b3;font-weight:700!important}
+  .asset-tools #sortFilter,.asset-tools #exportBtn{display:none!important}
+}
 </style>
 </head>
 <body>
@@ -3784,6 +4104,15 @@ input,select,textarea,button{max-width:100%;min-width:0}
 .js-error-banner{display:none;position:fixed;left:12px;right:12px;bottom:12px;z-index:9999;background:#fff1f0;border:1px solid #ffccc7;color:#a8071a;padding:10px 12px;border-radius:12px;font-size:13px;box-shadow:0 8px 30px rgba(15,23,42,.16)}
 .js-error-banner.show{display:block}
 .sync-diff-line{margin-top:6px;color:#475467;font-weight:700}
+
+/* v25.1 mobile precise search visibility fix: this belongs to the dashboard style block */
+@media(max-width:768px){
+  #tab-assets .asset-tools{display:grid!important;grid-template-columns:1fr!important;gap:8px!important;margin:0 0 10px!important;width:100%!important}
+  #tab-assets .asset-tools #sourceFilter{display:block!important;width:100%!important;height:46px!important;order:1!important;border-radius:14px!important}
+  #tab-assets .asset-tools #assetSearch{display:block!important;width:100%!important;height:44px!important;order:2!important;border-radius:14px!important;border:1px solid #d0d5dd!important;background:#fff!important;padding:0 13px!important;font-size:15px!important;font-weight:800!important;color:#101828!important;box-shadow:0 2px 9px rgba(15,23,42,.04)!important}
+  #tab-assets .asset-tools #assetSearch::placeholder{color:#98a2b3!important;font-weight:700!important}
+  #tab-assets .asset-tools button{display:none!important}
+}
 </style>
 </head>
 <body>
@@ -3869,7 +4198,7 @@ input,select,textarea,button{max-width:100%;min-width:0}
 </div>
 
 <div class="asset-tools">
-<input id="assetSearch" placeholder="搜索地址 / 关键词" oninput="renderList(true)">
+<input id="assetSearch" placeholder="在当前分类内精细搜索街道 / 地址" oninput="renderList(true)">
 <select id="sourceFilter" onchange="renderList(true)">
 <option value="all">全部数据源</option>
 </select>
@@ -3997,6 +4326,7 @@ input,select,textarea,button{max-width:100%;min-width:0}
 <div style="height:10px"></div>
 <div class="notice">用于处理网址换新或误改：旧网址会作为别名保留，历史资产仍归到当前标头标签下。回滚不会删除资产。</div>
 <div class="url-alias-row"><input id="aliasUrlInput" placeholder="粘贴旧网址，例如 https://boxin888.cc/"><button class="btn" onclick="addUrlAlias()">绑定旧网址</button></div>
+<div class="url-alias-row"><input id="aliasNameInput" placeholder="旧标头名，例如 万盛 / 盛世 / 创世"><button class="btn" onclick="addNameAlias()">绑定旧标头</button></div>
 <div style="height:8px"></div><button class="btn" onclick="repairSourceBindings()">修复历史分类归属</button>
 <div id="urlHistoryList" class="url-history-list"></div>
 </details>
@@ -4062,8 +4392,18 @@ input,select,textarea,button{max-width:100%;min-width:0}
 <button id="backToTopBtn" class="back-to-top" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑</button>
 <div id="jsErrorBanner" class="js-error-banner"></div>
 <script>
-window.addEventListener("error", function(e){try{var b=document.getElementById("jsErrorBanner"); if(b){b.textContent="页面脚本异常："+(e.message||"未知错误")+"。请刷新或回滚到稳定版。"; b.classList.add("show");}}catch(_){}});
-window.addEventListener("unhandledrejection", function(e){try{var b=document.getElementById("jsErrorBanner"); if(b){b.textContent="页面请求异常："+((e.reason&&e.reason.message)||e.reason||"未知错误")+"。"; b.classList.add("show");}}catch(_){}});
+function showJsBanner(text){try{var b=document.getElementById("jsErrorBanner"); if(b){b.textContent=text; b.classList.add("show"); setTimeout(function(){b.classList.remove("show");}, 6000);}}catch(_){}}
+window.addEventListener("error", function(e){
+    var m = String((e && e.message) || "");
+    // Some mobile browsers/extensions report third-party injected scripts only as "Script error.".
+    // Ignore that generic cross-origin noise so it does not scare users while the page still works.
+    if (!m || m === "Script error." || m === "Script error") return;
+    showJsBanner("页面脚本异常：" + m + "。请刷新后重试。");
+});
+window.addEventListener("unhandledrejection", function(e){
+    var m = String((e && e.reason && e.reason.message) || (e && e.reason) || "未知错误");
+    showJsBanner("页面请求异常：" + m + "。");
+});
 const $ = (id) => document.getElementById(id);
 
 let globalData = [];
@@ -4378,9 +4718,11 @@ function renderUrlHistory(payload) {
     if (!payload) { box.innerHTML = '<div class="notice">请选择一个已保存的数据源后查看。</div>'; return; }
     const rows = Array.isArray(payload.data) ? payload.data : [];
     const aliases = Array.isArray(payload.aliases) ? payload.aliases : [];
+    const nameAliases = Array.isArray(payload.name_aliases) ? payload.name_aliases : [];
     const aliasHtml = aliases.length ? `<div class="notice">已绑定旧网址：${aliases.map(a => escapeHtml(a.source_url)).join("；")}</div>` : '<div class="notice">暂无旧网址别名。换网址或手动绑定后会显示在这里。</div>';
+    const nameAliasHtml = nameAliases.length ? `<div class="notice">已绑定旧标头：${nameAliases.map(a => `${escapeHtml(a.old_group)} → ${escapeHtml(a.new_group)}`).join("；")}</div>` : '<div class="notice">暂无旧标头别名。品牌/地址库改名后，可把旧标头绑定到当前数据源。</div>';
     const historyHtml = rows.length ? rows.map(r => `<div class="url-history-item"><div><code>旧：${escapeHtml(r.old_url || "-")}</code><code>新：${escapeHtml(r.new_url || "-")}</code><div class="hint">${escapeHtml(r.created_at || "-")} · ${escapeHtml(r.reason || "网址变更")}</div></div><button class="btn" onclick="rollbackUrl(${Number(r.id)})">回滚</button></div>`).join("") : '<div class="notice">暂无网址变更记录。以后修改网址会自动记录。</div>';
-    box.innerHTML = aliasHtml + historyHtml;
+    box.innerHTML = aliasHtml + nameAliasHtml + historyHtml;
 }
 async function loadUrlHistory() {
     const id = $("sourceSelect") ? $("sourceSelect").value : "";
@@ -4394,6 +4736,14 @@ async function addUrlAlias() {
     if (!confirm("确认把这个旧网址绑定到当前数据源标头下？\n这会尝试把历史未知分类重新归属到当前标头。")) return;
     const r = await apiFetch(`/api/sources/${id}/aliases`, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({source_url:value})}); if (!r) return;
     const j = await r.json(); msg(j.message || "旧网址已绑定", j.success ? "ok" : "bad"); if (j.success && input) input.value = "";
+    await loadUrlHistory(); await fetchRecords();
+}
+async function addNameAlias() {
+    const id = $("sourceSelect").value; const input = $("aliasNameInput"); const value = input ? input.value.trim() : "";
+    if (!id) { msg("请先选择数据源。", "warn"); return; } if (!value) { msg("请填写旧标头名。", "warn"); return; }
+    if (!confirm("确认把这个旧标头绑定到当前数据源？\n例如地址库从“万盛”改成“强盛”，绑定后旧记录会继续归到当前标头。")) return;
+    const r = await apiFetch(`/api/sources/${id}/name_aliases`, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({old_name:value})}); if (!r) return;
+    const j = await r.json(); msg(j.message || "旧标头已绑定", j.success ? "ok" : "bad"); if (j.success && input) input.value = "";
     await loadUrlHistory(); await fetchRecords();
 }
 async function rollbackUrl(historyId) {
